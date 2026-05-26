@@ -1,0 +1,337 @@
+// src/services/reservation.service.ts
+import { reservationRepository } from '@/repositories/reservation.repository';
+import { roomRepository } from '@/repositories/room.repository';
+import { createReservationSchema, adjustReservationSchema } from '@/lib/validations/reservation.schema';
+import { audit } from '@/lib/audit';
+import { notificationService, buildEmailPayload } from '@/services/notification.service';
+import { prisma } from '@/lib/prisma';
+import type { EstadoReserva } from '@prisma/client';
+
+/**
+ * Convierte string "HH:MM" a un Date con solo la parte de tiempo.
+ * Prisma @db.Time() usa Date pero solo importa la hora.
+ */
+function timeStringToDate(time: string): Date {
+  const [h, m] = time.split(':').map(Number);
+  const d = new Date('2000-01-01T00:00:00.000Z');
+  d.setUTCHours(h, m, 0, 0);
+  return d;
+}
+
+export const reservationService = {
+  /** Listar reservas según el rol del usuario */
+  async list(params: {
+    facultadId: number;
+    usuarioId: number;
+    rol: 'DOCENTE' | 'SECRETARIA';
+    estado?: EstadoReserva;
+    salaId?: number;
+    filtroUsuarioId?: number;
+    fechaInicio?: Date;
+    fechaFin?: Date;
+    page?: number;
+    limit?: number;
+  }) {
+    return reservationRepository.findAll({
+      facultadId: params.facultadId,
+      // DOCENTE solo ve sus propias reservas, SECRETARIA ve todas las de la facultad
+      usuarioId: params.rol === 'DOCENTE' ? params.usuarioId : undefined,
+      estado: params.estado,
+      salaId: params.salaId,
+      filtroUsuarioId: params.filtroUsuarioId,
+      fechaInicio: params.fechaInicio,
+      fechaFin: params.fechaFin,
+      page: params.page,
+      limit: params.limit,
+    });
+  },
+
+  /** Crear reserva (DOCENTE + SECRETARIA) */
+  async create(
+    data: { salaId: number; fecha: string; horaInicio: string; horaFin: string; motivo?: string },
+    usuarioId: number,
+    facultadId: number,
+    ip?: string
+  ) {
+    // Validar datos con Zod (incluye R-02: franja 7:00-21:30)
+    const validated = createReservationSchema.parse(data);
+
+    // Verificar que la sala existe, está habilitada y pertenece a la facultad
+    const sala = await roomRepository.findById(validated.salaId);
+    if (!sala) throw new Error('Sala no encontrada');
+    if (!sala.habilitada) throw new Error('La sala no está habilitada para reservas');
+    if (sala.facultadId !== facultadId) throw new Error('No puede reservar salas de otra facultad');
+
+    // Convertir strings a Date
+    const fecha = new Date(validated.fecha + 'T00:00:00.000Z');
+    const horaInicio = timeStringToDate(validated.horaInicio);
+    const horaFin = timeStringToDate(validated.horaFin);
+
+    // Verificar no solapamiento (R-03, RF-11)
+    const hasOverlap = await reservationRepository.checkOverlap(
+      validated.salaId,
+      fecha,
+      horaInicio,
+      horaFin
+    );
+    if (hasOverlap) {
+      throw new Error('Ya existe una reserva confirmada en ese horario para esta sala (R-03)');
+    }
+
+    // Crear reserva
+    const reserva = await reservationRepository.create({
+      salaId: validated.salaId,
+      usuarioId,
+      fecha,
+      horaInicio,
+      horaFin,
+      motivo: validated.motivo,
+    });
+
+    // Auditoría (RF-16)
+    await audit({
+      usuarioId,
+      accion: 'CREAR_RESERVA',
+      entidad: 'RESERVA',
+      entidadId: reserva.id,
+      datosNuevos: {
+        salaId: reserva.salaId,
+        fecha: validated.fecha,
+        horaInicio: validated.horaInicio,
+        horaFin: validated.horaFin,
+        motivo: reserva.motivo,
+      },
+      ipAddress: ip,
+    });
+
+    // Confirmacion al titular (notificacion in-app + email).
+    // Si la secretaria reservo a nombre de otro docente, el titular es ese otro
+    // — pero como el endpoint actual solo deja reservar a uno mismo, titular === usuarioId.
+    const titular = await prisma.usuario.findUnique({
+      where: { id: usuarioId },
+      select: { correoInstitucional: true },
+    });
+    if (titular) {
+      const titulo = `Reserva confirmada en ${sala.nombre}`;
+      const mensaje =
+        `Tu reserva quedó registrada: ${validated.fecha} ${validated.horaInicio}-${validated.horaFin}` +
+        `${validated.motivo ? ` — ${validated.motivo}` : ''}.`;
+
+      await notificationService.create({
+        usuarioId,
+        tipo: 'GENERAL',
+        titulo,
+        mensaje,
+        metadata: {
+          kind: 'reserva-confirmada',
+          reservaId: reserva.id,
+          salaId: sala.id,
+          salaNombre: sala.nombre,
+          fecha: validated.fecha,
+          horaInicio: validated.horaInicio,
+          horaFin: validated.horaFin,
+        },
+        email: buildEmailPayload(titular.correoInstitucional, titulo, mensaje, {
+          'Sala': sala.nombre,
+          'Fecha': validated.fecha,
+          'Horario': `${validated.horaInicio} – ${validated.horaFin}`,
+          ...(validated.motivo ? { 'Motivo': validated.motivo } : {}),
+        }),
+      });
+    }
+
+    return reserva;
+  },
+
+  /** Cancelar reserva (R-06: nunca eliminar, solo cancelar) */
+  async cancel(
+    reservaId: number,
+    usuarioId: number,
+    rol: 'DOCENTE' | 'SECRETARIA',
+    facultadId: number,
+    ip?: string
+  ) {
+    const reserva = await reservationRepository.findById(reservaId);
+    if (!reserva) throw new Error('Reserva no encontrada');
+
+    // DOCENTE solo cancela sus propias reservas, SECRETARIA todas las de su facultad
+    if (rol === 'DOCENTE' && reserva.usuarioId !== usuarioId) {
+      throw new Error('Solo puede cancelar sus propias reservas');
+    }
+    if (rol === 'SECRETARIA' && reserva.sala.facultadId !== facultadId) {
+      throw new Error('No puede cancelar reservas de otra facultad');
+    }
+
+    if (reserva.estado === 'CANCELADA') {
+      throw new Error('La reserva ya está cancelada');
+    }
+
+    const cancelled = await reservationRepository.cancel(reservaId, usuarioId);
+
+    await audit({
+      usuarioId,
+      accion: 'CANCELAR_RESERVA',
+      entidad: 'RESERVA',
+      entidadId: reservaId,
+      datosAnteriores: { estado: 'CONFIRMADA' },
+      datosNuevos: { estado: 'CANCELADA', canceladoPor: usuarioId },
+      ipAddress: ip,
+    });
+
+    // Notificar al titular si quien cancela NO es el titular (caso secretaria).
+    // El docente cancelando su propia reserva no se notifica a si mismo.
+    if (reserva.usuarioId !== usuarioId) {
+      const fmtFecha = (d: Date) => d.toISOString().split('T')[0];
+      const fmtTime = (d: Date) =>
+        `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+      const titulo = `Tu reserva en ${reserva.sala.nombre} fue cancelada`;
+      const mensaje =
+        `Una secretaria canceló tu reserva del ${fmtFecha(reserva.fecha)} ` +
+        `(${fmtTime(reserva.horaInicio)}-${fmtTime(reserva.horaFin)}). ` +
+        `Por favor revisa la disponibilidad si necesitas reprogramar.`;
+
+      await notificationService.create({
+        usuarioId: reserva.usuarioId,
+        tipo: 'RESERVA_CANCELADA_POR_SECRETARIA',
+        titulo,
+        mensaje,
+        metadata: {
+          reservaId,
+          salaId: reserva.salaId,
+          salaNombre: reserva.sala.nombre,
+          fecha: fmtFecha(reserva.fecha),
+          horaInicio: fmtTime(reserva.horaInicio),
+          horaFin: fmtTime(reserva.horaFin),
+          canceladoPor: usuarioId,
+        },
+        email: buildEmailPayload(reserva.usuario.correoInstitucional, titulo, mensaje, {
+          'Sala': reserva.sala.nombre,
+          'Fecha': fmtFecha(reserva.fecha),
+          'Horario': `${fmtTime(reserva.horaInicio)} – ${fmtTime(reserva.horaFin)}`,
+        }),
+      });
+    }
+
+    return cancelled;
+  },
+
+  /** Ajustar reserva — solo SECRETARIA (HU-11) */
+  async adjust(
+    reservaId: number,
+    data: { salaId?: number; fecha?: string; horaInicio?: string; horaFin?: string; motivo?: string },
+    usuarioId: number,
+    facultadId: number,
+    ip?: string
+  ) {
+    const reserva = await reservationRepository.findById(reservaId);
+    if (!reserva) throw new Error('Reserva no encontrada');
+    if (reserva.estado === 'CANCELADA') throw new Error('No se puede ajustar una reserva cancelada');
+    if (reserva.sala.facultadId !== facultadId) throw new Error('No puede ajustar reservas de otra facultad');
+
+    const validated = adjustReservationSchema.parse(data);
+
+    const salaId = validated.salaId ?? reserva.salaId;
+
+    // Si cambia la sala, verificar que esté habilitada y pertenezca a la facultad
+    if (validated.salaId) {
+      const sala = await roomRepository.findById(salaId);
+      if (!sala) throw new Error('Sala no encontrada');
+      if (!sala.habilitada) throw new Error('La sala no está habilitada para reservas');
+      if (sala.facultadId !== facultadId) throw new Error('No puede reservar salas de otra facultad');
+    }
+
+    // Resolver tiempos: usar los nuevos si vienen, si no los existentes
+    const fecha = validated.fecha
+      ? new Date(validated.fecha + 'T00:00:00.000Z')
+      : reserva.fecha;
+
+    const horaInicioStr = validated.horaInicio ?? formatTime(reserva.horaInicio);
+    const horaFinStr = validated.horaFin ?? formatTime(reserva.horaFin);
+    const horaInicio = timeStringToDate(horaInicioStr);
+    const horaFin = timeStringToDate(horaFinStr);
+
+    // Validar franja horaria (R-02)
+    const iniMin = horaInicio.getUTCHours() * 60 + horaInicio.getUTCMinutes();
+    const finMin = horaFin.getUTCHours() * 60 + horaFin.getUTCMinutes();
+    if (iniMin < 7 * 60) throw new Error('La hora de inicio no puede ser antes de las 7:00 AM (R-02)');
+    if (finMin > 21 * 60 + 30) throw new Error('La hora de fin no puede ser después de las 9:30 PM (R-02)');
+    if (iniMin >= finMin) throw new Error('La hora de inicio debe ser anterior a la hora de fin');
+
+    // Verificar solapamiento excluyendo la reserva actual (R-03)
+    const hasOverlap = await reservationRepository.checkOverlap(salaId, fecha, horaInicio, horaFin, reservaId);
+    if (hasOverlap) throw new Error('El nuevo horario se solapa con otra reserva confirmada en esa sala (R-03)');
+
+    const datosAnteriores = {
+      salaId: reserva.salaId,
+      fecha: reserva.fecha,
+      horaInicio: formatTime(reserva.horaInicio),
+      horaFin: formatTime(reserva.horaFin),
+      motivo: reserva.motivo,
+    };
+
+    const updated = await reservationRepository.update(reservaId, {
+      salaId,
+      fecha,
+      horaInicio,
+      horaFin,
+      motivo: validated.motivo !== undefined ? validated.motivo : (reserva.motivo ?? ''),
+    });
+
+    await audit({
+      usuarioId,
+      accion: 'AJUSTAR_RESERVA',
+      entidad: 'RESERVA',
+      entidadId: reservaId,
+      datosAnteriores,
+      datosNuevos: { salaId, fecha: validated.fecha, horaInicio: horaInicioStr, horaFin: horaFinStr, motivo: validated.motivo },
+      ipAddress: ip,
+    });
+
+    // HU-011: notificar al titular si la SECRETARIA modificó la reserva (in-app + email)
+    if (reserva.usuarioId !== usuarioId) {
+      const titular = await prisma.usuario.findUnique({
+        where: { id: reserva.usuarioId },
+        select: { nombre: true, correoInstitucional: true },
+      });
+      const sala = await prisma.sala.findUnique({
+        where: { id: salaId },
+        select: { nombre: true },
+      });
+      if (titular && sala) {
+        const fmtFecha = (d: Date) => d.toISOString().split('T')[0];
+        const titulo = `Tu reserva en ${sala.nombre} fue ajustada`;
+        const mensaje =
+          `Una secretaria modificó tu reserva. Antes: ${fmtFecha(reserva.fecha)} ${datosAnteriores.horaInicio}-${datosAnteriores.horaFin}. ` +
+          `Ahora: ${fmtFecha(fecha)} ${horaInicioStr}-${horaFinStr}. ` +
+          `Motivo: ${validated.motivo ?? reserva.motivo ?? '(sin motivo)'}`;
+
+        await notificationService.create({
+          usuarioId: reserva.usuarioId,
+          tipo: 'RESERVA_AJUSTADA',
+          titulo,
+          mensaje,
+          metadata: {
+            reservaId,
+            salaId,
+            salaNombre: sala.nombre,
+            antes: { fecha: fmtFecha(reserva.fecha), horaInicio: datosAnteriores.horaInicio, horaFin: datosAnteriores.horaFin },
+            ahora: { fecha: fmtFecha(fecha), horaInicio: horaInicioStr, horaFin: horaFinStr },
+          },
+          email: buildEmailPayload(titular.correoInstitucional, titulo, mensaje, {
+            'Sala': sala.nombre,
+            'Antes': `${fmtFecha(reserva.fecha)} ${datosAnteriores.horaInicio}-${datosAnteriores.horaFin}`,
+            'Ahora': `${fmtFecha(fecha)} ${horaInicioStr}-${horaFinStr}`,
+          }),
+        });
+      }
+    }
+
+    return updated;
+  },
+};
+
+function formatTime(date: Date): string {
+  const h = date.getUTCHours().toString().padStart(2, '0');
+  const m = date.getUTCMinutes().toString().padStart(2, '0');
+  return `${h}:${m}`;
+}

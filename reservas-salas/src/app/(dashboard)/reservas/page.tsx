@@ -1,0 +1,812 @@
+'use client';
+
+import { useState, useEffect, useCallback } from 'react';
+import { useSession } from 'next-auth/react';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { toast } from 'sonner';
+import {
+  Plus, CalendarDays, XCircle, Clock, MapPin, User, Edit3, Filter, Users, Eye, History,
+} from 'lucide-react';
+import {
+  ConfirmDialog, SkeletonCard, EmptyState, Button, Input, Modal, Card,
+  ResourceChip, AvailabilityTimeline, AuditLogModal,
+} from '@/components/ui';
+
+interface SalaRecurso {
+  id: number;
+  recurso: { id: number; nombre: string; categoria: string; icono: string };
+}
+
+interface Sala {
+  id: number;
+  nombre: string;
+  ubicacion: string | null;
+  capacidad?: number;
+  habilitada?: boolean;
+  salaRecursos?: SalaRecurso[];
+}
+
+interface Ocupado {
+  id: number;
+  horaInicio: string;
+  horaFin: string;
+  motivo?: string;
+  usuarioNombre?: string;
+}
+
+interface Reserva {
+  id: number;
+  motivo: string | null;
+  fecha: string;
+  horaInicio: string;
+  horaFin: string;
+  estado: 'CONFIRMADA' | 'CANCELADA';
+  sala: Sala;
+  usuario: { id: number; nombre: string; correoInstitucional: string };
+}
+
+interface ApiResponse {
+  reservas: Reserva[];
+  total: number;
+  page: number;
+  totalPages: number;
+}
+
+function formatTime(isoTime: string): string {
+  try {
+    const d = new Date(isoTime);
+    return d.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' });
+  } catch { return isoTime; }
+}
+
+function isoToTimeInput(isoTime: string): string {
+  try {
+    const d = new Date(isoTime);
+    const h = d.getUTCHours().toString().padStart(2, '0');
+    const m = d.getUTCMinutes().toString().padStart(2, '0');
+    return `${h}:${m}`;
+  } catch { return ''; }
+}
+
+function formatDate(isoDate: string): string {
+  try {
+    const d = new Date(isoDate + 'T12:00:00');
+    return d.toLocaleDateString('es-CO', { day: 'numeric', month: 'numeric', year: 'numeric' });
+  } catch { return isoDate; }
+}
+
+/** Formato largo y legible para vistas de detalle: "jueves, 7 de mayo de 2026". */
+function formatDateLong(isoDate: string): string {
+  try {
+    const d = new Date(isoDate + 'T12:00:00');
+    return d.toLocaleDateString('es-CO', {
+      weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    });
+  } catch { return isoDate; }
+}
+
+function isoToDateInput(isoDate: string): string {
+  return isoDate.split('T')[0];
+}
+
+export default function ReservasPage() {
+  const { data: session } = useSession();
+  const isSecretaria = session?.user?.rol === 'SECRETARIA';
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  const [data, setData] = useState<ApiResponse | null>(null);
+  const [salas, setSalas] = useState<Sala[]>([]);
+  const [todasSalas, setTodasSalas] = useState<Sala[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState<string>('');
+  const [page, setPage] = useState(1);
+
+  // Disponibilidad del día (timeline)
+  const [ocupados, setOcupados] = useState<Ocupado[]>([]);
+  const [loadingAvail, setLoadingAvail] = useState(false);
+
+  // Filtros SECRETARIA (HU-13)
+  const [filtroSalaId, setFiltroSalaId] = useState<string>('');
+  const [filtroUsuarioId, setFiltroUsuarioId] = useState<string>(''); // CP-013 E3
+  const [filtroFechaInicio, setFiltroFechaInicio] = useState('');
+  const [filtroFechaFin, setFiltroFechaFin] = useState('');
+  const [showFilters, setShowFilters] = useState(false);
+  const [usuariosFacultad, setUsuariosFacultad] = useState<Array<{ id: number; nombre: string; correoInstitucional: string; rol: string }>>([]);
+
+  // Modal crear reserva
+  const [showModal, setShowModal] = useState(false);
+  const [form, setForm] = useState({ salaId: 0, fecha: '', horaInicio: '', horaFin: '', motivo: '' });
+  const [saving, setSaving] = useState(false);
+
+  // Modal ajustar reserva (HU-11)
+  const [adjusting, setAdjusting] = useState<Reserva | null>(null);
+  const [adjustForm, setAdjustForm] = useState({ salaId: 0, fecha: '', horaInicio: '', horaFin: '', motivo: '' });
+  const [savingAdjust, setSavingAdjust] = useState(false);
+
+  // Confirmación de cancelación
+  const [cancelId, setCancelId] = useState<number | null>(null);
+  const [cancelLoading, setCancelLoading] = useState(false);
+
+  // CP-012 E3: modal de detalle de reserva
+  const [detalleReserva, setDetalleReserva] = useState<Reserva | null>(null);
+  // CP-011 E5: modal de historial de auditoría de la reserva
+  const [auditReservaId, setAuditReservaId] = useState<{ id: number; sala: string } | null>(null);
+
+  const buildQuery = useCallback(() => {
+    const q = new URLSearchParams({ page: String(page), limit: '20' });
+    if (filter) q.set('estado', filter);
+    if (isSecretaria && filtroSalaId) q.set('salaId', filtroSalaId);
+    if (isSecretaria && filtroUsuarioId) q.set('usuarioId', filtroUsuarioId); // CP-013 E3
+    if (isSecretaria && filtroFechaInicio) q.set('fechaInicio', filtroFechaInicio);
+    if (isSecretaria && filtroFechaFin) q.set('fechaFin', filtroFechaFin);
+    return q;
+  }, [page, filter, isSecretaria, filtroSalaId, filtroUsuarioId, filtroFechaInicio, filtroFechaFin]);
+
+  const fetchReservas = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/reservations?${buildQuery()}`);
+      setData(await res.json());
+    } catch { toast.error('Error al cargar'); }
+    finally { setLoading(false); }
+  }, [buildQuery]);
+
+  const fetchSalas = useCallback(async () => {
+    try {
+      const res = await fetch('/api/rooms');
+      const rooms: (Sala & { habilitada: boolean })[] = await res.json();
+      setTodasSalas(rooms);
+      setSalas(rooms.filter((s) => s.habilitada));
+    } catch {}
+  }, []);
+
+  useEffect(() => { fetchReservas(); }, [fetchReservas]);
+  useEffect(() => { fetchSalas(); }, [fetchSalas]);
+
+  // Polling cada 30s para reflejar cambios hechos en otra sesion
+  // (ej. cancelaciones/ajustes por secretaria). Se pausa con modales
+  // abiertos y cuando la pestaña esta oculta.
+  useEffect(() => {
+    const modalAbierto = showModal || adjusting !== null || cancelId !== null;
+    if (modalAbierto) return;
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') fetchReservas();
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [fetchReservas, showModal, adjusting, cancelId]);
+
+  // Cargar usuarios de la facultad para filtro por profesor (CP-013 E3)
+  useEffect(() => {
+    if (!isSecretaria) return;
+    fetch('/api/users')
+      .then((r) => r.ok ? r.json() : [])
+      .then((data) => Array.isArray(data) && setUsuariosFacultad(data))
+      .catch(() => {});
+  }, [isSecretaria]);
+
+  // Preselección desde query (?salaId=X&new=1) al entrar desde el catálogo
+  useEffect(() => {
+    const sid = searchParams.get('salaId');
+    const isNew = searchParams.get('new') === '1';
+    if (sid && isNew) {
+      const salaId = Number(sid);
+      if (Number.isFinite(salaId)) {
+        setForm({ salaId, fecha: '', horaInicio: '', horaFin: '', motivo: '' });
+        setShowModal(true);
+        // Limpiar query para evitar reabrir en navegación
+        router.replace('/reservas', { scroll: false });
+      }
+    }
+  }, [searchParams, router]);
+
+  // Cargar disponibilidad de la sala/fecha seleccionadas
+  const fetchAvailability = useCallback(async (salaId: number, fecha: string) => {
+    if (!salaId || !fecha) { setOcupados([]); return; }
+    setLoadingAvail(true);
+    try {
+      const res = await fetch(`/api/rooms/${salaId}/availability?fecha=${fecha}`);
+      const json = await res.json();
+      if (res.ok) setOcupados(json.ocupados || []);
+      else setOcupados([]);
+    } catch { setOcupados([]); }
+    finally { setLoadingAvail(false); }
+  }, []);
+
+  useEffect(() => {
+    if (showModal && form.salaId && form.fecha) {
+      fetchAvailability(Number(form.salaId), form.fecha);
+    } else {
+      setOcupados([]);
+    }
+  }, [showModal, form.salaId, form.fecha, fetchAvailability]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault(); setSaving(true);
+    try {
+      if (form.fecha) {
+        const day = new Date(form.fecha + 'T00:00:00.000Z').getUTCDay();
+        if (day === 0) { toast.error('No se pueden hacer reservas los domingos'); setSaving(false); return; }
+      }
+      const res = await fetch('/api/reservations', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...form, salaId: Number(form.salaId) }),
+      });
+      const result = await res.json();
+      if (!res.ok) { toast.error(result.error || 'Error'); return; }
+      toast.success('Reserva creada'); setShowModal(false); fetchReservas();
+    } catch { toast.error('Error de conexión'); }
+    finally { setSaving(false); }
+  };
+
+  const handleCancel = (id: number) => setCancelId(id);
+
+  const confirmCancel = async () => {
+    if (cancelId == null) return;
+    setCancelLoading(true);
+    try {
+      const res = await fetch(`/api/reservations/${cancelId}/cancel`, { method: 'PATCH' });
+      const result = await res.json();
+      if (!res.ok) { toast.error(result.error || 'Error al cancelar'); return; }
+      toast.success('Reserva cancelada'); fetchReservas();
+      setCancelId(null);
+    } catch { toast.error('Error'); }
+    finally { setCancelLoading(false); }
+  };
+
+  const openAdjust = (r: Reserva) => {
+    setAdjustForm({
+      salaId: r.sala.id,
+      fecha: isoToDateInput(r.fecha),
+      horaInicio: isoToTimeInput(r.horaInicio),
+      horaFin: isoToTimeInput(r.horaFin),
+      motivo: r.motivo ?? '',
+    });
+    setAdjusting(r);
+  };
+
+  const handleAdjust = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adjusting) return;
+    if (adjustForm.fecha) {
+      const day = new Date(adjustForm.fecha + 'T00:00:00.000Z').getUTCDay();
+      if (day === 0) { toast.error('No se pueden hacer reservas los domingos'); return; }
+    }
+    setSavingAdjust(true);
+    try {
+      const res = await fetch(`/api/reservations/${adjusting.id}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...adjustForm, salaId: Number(adjustForm.salaId) }),
+      });
+      const result = await res.json();
+      if (!res.ok) { toast.error(result.error || 'Error al ajustar'); return; }
+      toast.success('Reserva ajustada'); setAdjusting(null); fetchReservas();
+    } catch { toast.error('Error de conexión'); }
+    finally { setSavingAdjust(false); }
+  };
+
+  const clearFilters = () => {
+    setFiltroSalaId(''); setFiltroUsuarioId(''); setFiltroFechaInicio(''); setFiltroFechaFin(''); setPage(1);
+  };
+
+  const reservas = data?.reservas || [];
+  const activas = reservas.filter((r) => r.estado === 'CONFIRMADA').length;
+  const historial = reservas.filter((r) => r.estado === 'CANCELADA').length;
+  const hasActiveFilters = filtroSalaId || filtroUsuarioId || filtroFechaInicio || filtroFechaFin;
+  const salaSel = salas.find((s) => s.id === Number(form.salaId));
+
+  return (
+    <div className="fade-in">
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <h1 style={{ fontSize: '1.35rem', fontWeight: 700 }}>
+            {isSecretaria ? 'Reservas' : 'Mis Reservas'}
+          </h1>
+        </div>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          {isSecretaria && (
+            <Button
+              variant="secondary"
+              onClick={() => setShowFilters(!showFilters)}
+              leftIcon={<Filter size={15} />}
+              className="relative"
+            >
+              Filtros
+              {hasActiveFilters && (
+                <span style={{
+                  position: 'absolute', top: '-6px', right: '-6px',
+                  width: '14px', height: '14px', borderRadius: '50%',
+                  background: 'var(--primary)', fontSize: '0.6rem', color: 'var(--primary-fg)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}>!</span>
+              )}
+            </Button>
+          )}
+          <Button
+            variant="primary"
+            onClick={() => { setForm({ salaId: 0, fecha: '', horaInicio: '', horaFin: '', motivo: '' }); setShowModal(true); }}
+            leftIcon={<Plus size={16} />}
+          >
+            Nueva Reserva
+          </Button>
+        </div>
+      </div>
+
+      {/* Panel de filtros SECRETARIA (HU-13) */}
+      {isSecretaria && showFilters && (
+        <Card padding="md" className="mb-5">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px', alignItems: 'end' }}>
+            <div>
+              <label className="label" style={{ fontSize: '0.75rem' }}>Sala</label>
+              <select className="input-field" value={filtroSalaId} onChange={(e) => { setFiltroSalaId(e.target.value); setPage(1); }}>
+                <option value="">Todas las salas</option>
+                {todasSalas.map((s) => (
+                  <option key={s.id} value={s.id}>{s.nombre}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              {/* CP-013 E3: filtro por profesor/usuario */}
+              <label className="label" style={{ fontSize: '0.75rem' }}>Profesor / Usuario</label>
+              <select className="input-field" value={filtroUsuarioId} onChange={(e) => { setFiltroUsuarioId(e.target.value); setPage(1); }}>
+                <option value="">Todos los usuarios</option>
+                {usuariosFacultad.map((u) => (
+                  <option key={u.id} value={u.id}>{u.nombre} ({u.rol === 'SECRETARIA' ? 'Sec' : 'Doc'})</option>
+                ))}
+              </select>
+            </div>
+            <Input
+              label="Desde"
+              type="date"
+              value={filtroFechaInicio}
+              onChange={(e) => { setFiltroFechaInicio(e.target.value); setPage(1); }}
+            />
+            <Input
+              label="Hasta"
+              type="date"
+              value={filtroFechaFin}
+              onChange={(e) => { setFiltroFechaFin(e.target.value); setPage(1); }}
+            />
+            {hasActiveFilters && (
+              <Button variant="secondary" onClick={clearFilters}>
+                Limpiar filtros
+              </Button>
+            )}
+          </div>
+        </Card>
+      )}
+
+      <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', marginBottom: '20px' }}>
+        {isSecretaria ? 'Gestiona todas las reservas de la facultad' : 'Gestiona tus reservas de salas'}
+      </p>
+
+      {/* Stats */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px', marginBottom: '24px' }}>
+        <div className="stat-card">
+          <div className="stat-value" style={{ color: 'var(--info)' }}>{activas}</div>
+          <div className="stat-label">Reservas Activas</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">{historial}</div>
+          <div className="stat-label">Canceladas</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value" style={{ color: 'var(--info)' }}>{data?.total || 0}</div>
+          <div className="stat-label">Total</div>
+        </div>
+      </div>
+
+      {/* Filter Tabs */}
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+        {[
+          { value: '', label: 'Todas' },
+          { value: 'CONFIRMADA', label: 'Activas' },
+          { value: 'CANCELADA', label: 'Historial' },
+        ].map((f) => (
+          <Button
+            key={f.value}
+            variant={filter === f.value ? 'primary' : 'secondary'}
+            size="sm"
+            onClick={() => { setFilter(f.value); setPage(1); }}
+          >
+            {f.label}
+          </Button>
+        ))}
+      </div>
+
+      {/* Reservas */}
+      {loading ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)}
+        </div>
+      ) : reservas.length === 0 ? (
+        <EmptyState
+          icon={<CalendarDays size={40} />}
+          title="No se encontraron reservas"
+          description="Crea una nueva reserva para comenzar a gestionar tus salas."
+          action={
+            <Button
+              variant="primary"
+              onClick={() => setShowModal(true)}
+              leftIcon={<Plus size={16} />}
+            >
+              Crear reserva
+            </Button>
+          }
+        />
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {reservas.map((r) => (
+            <Card key={r.id} padding="lg">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '10px' }}>
+                <div>
+                  <h3 style={{ fontWeight: 600, fontSize: '0.95rem' }}>{r.sala.nombre}</h3>
+                  {r.sala.ubicacion && (
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '3px' }}>
+                      <MapPin size={11} /> {r.sala.ubicacion}
+                    </p>
+                  )}
+                </div>
+                <span className={`badge ${r.estado === 'CONFIRMADA' ? 'badge-success' : 'badge-danger'}`}>
+                  {r.estado === 'CONFIRMADA' ? 'Activa' : 'Cancelada'}
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '10px' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '3px' }}>
+                  <CalendarDays size={13} /> {formatDate(r.fecha.split('T')[0])}
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '3px' }}>
+                  <Clock size={13} /> {formatTime(r.horaInicio)} - {formatTime(r.horaFin)}
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '3px' }}>
+                  <User size={13} /> {r.usuario.nombre}
+                </span>
+              </div>
+
+              {r.motivo && (
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '12px' }}>
+                  <strong>Motivo:</strong> {r.motivo}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: '8px', borderTop: '1px solid var(--border)', paddingTop: '12px' }}>
+                {/* CP-012 E3: ver detalle completo de la reserva */}
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setDetalleReserva(r)}
+                  leftIcon={<Eye size={13} />}
+                  title="Ver detalle de la reserva"
+                >
+                  Detalle
+                </Button>
+                {/* CP-011 E5: ver historial de cambios (solo SECRETARIA) */}
+                {isSecretaria && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setAuditReservaId({ id: r.id, sala: r.sala.nombre })}
+                    title="Ver historial de cambios"
+                    aria-label="Ver historial de cambios"
+                  >
+                    <History size={13} />
+                  </Button>
+                )}
+                {r.estado === 'CONFIRMADA' && isSecretaria && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => openAdjust(r)}
+                    leftIcon={<Edit3 size={13} />}
+                    fullWidth
+                  >
+                    Ajustar
+                  </Button>
+                )}
+                {r.estado === 'CONFIRMADA' &&
+                  (isSecretaria || r.usuario.id === session?.user?.id) && (
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => handleCancel(r.id)}
+                      leftIcon={<XCircle size={13} />}
+                      fullWidth={!isSecretaria}
+                    >
+                      Cancelar
+                    </Button>
+                  )}
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Pagination */}
+      {data && data.totalPages > 1 && (
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '24px' }}>
+          <Button variant="secondary" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)}>Anterior</Button>
+          <span style={{ display: 'flex', alignItems: 'center', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Página {data.page} de {data.totalPages}</span>
+          <Button variant="secondary" size="sm" disabled={page >= data.totalPages} onClick={() => setPage(page + 1)}>Siguiente</Button>
+        </div>
+      )}
+
+      {/* ─── Modal: Crear Reserva ─── */}
+      <Modal
+        open={showModal}
+        onClose={() => setShowModal(false)}
+        title="Crear Reserva"
+        description="Reserva de sala de estudio"
+        size="lg"
+      >
+        <div style={{
+          padding: '12px 16px', borderRadius: '10px', marginBottom: '20px',
+          background: 'var(--info-bg)', border: '1px solid rgba(37,99,235,0.15)',
+          fontSize: '0.75rem', color: 'var(--info)',
+        }}>
+          <strong>📋 Política de Reservas</strong>
+          <ul style={{ margin: '6px 0 0 16px', lineHeight: 1.7 }}>
+            <li>Horario: 7:00 AM — 9:30 PM</li>
+            <li>No se permiten reservas superpuestas</li>
+            <li>No se permiten reservas en fechas pasadas</li>
+            <li>No se permiten reservas los domingos</li>
+          </ul>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: '14px' }}>
+            <label className="label">Sala *</label>
+            <select className="input-field" value={form.salaId}
+              onChange={(e) => setForm({ ...form, salaId: Number(e.target.value) })} required>
+              <option value={0}>Seleccione una sala</option>
+              {salas.map((s) => (
+                <option key={s.id} value={s.id}>{s.nombre}{s.ubicacion ? ` — ${s.ubicacion}` : ''}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Panel de contexto de la sala seleccionada */}
+          {salaSel && (
+            <div
+              style={{
+                padding: '12px 14px', borderRadius: '10px', marginBottom: '14px',
+                background: 'var(--bg-input)', border: '1px solid var(--border)',
+              }}
+            >
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', fontSize: '0.8rem', marginBottom: salaSel.salaRecursos?.length ? '8px' : 0 }}>
+                {salaSel.ubicacion && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--text-secondary)' }}>
+                    <MapPin size={13} /> {salaSel.ubicacion}
+                  </span>
+                )}
+                {typeof salaSel.capacidad === 'number' && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--text-secondary)' }}>
+                    <Users size={13} /> Capacidad {salaSel.capacidad}
+                  </span>
+                )}
+              </div>
+              {salaSel.salaRecursos && salaSel.salaRecursos.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                  {salaSel.salaRecursos.map((sr) => (
+                    <ResourceChip
+                      key={sr.id}
+                      nombre={sr.recurso.nombre}
+                      categoria={sr.recurso.categoria}
+                      icono={sr.recurso.icono}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          <Input
+            label="Fecha *"
+            type="date"
+            value={form.fecha}
+            min={new Date().toISOString().split('T')[0]}
+            onChange={(e) => setForm({ ...form, fecha: e.target.value })}
+            required
+            wrapperClassName="mb-3"
+          />
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '14px' }}>
+            <Input
+              label="Hora de Inicio *"
+              type="time"
+              value={form.horaInicio}
+              min="07:00"
+              max="21:00"
+              onChange={(e) => setForm({ ...form, horaInicio: e.target.value })}
+              required
+            />
+            <Input
+              label="Hora de Fin *"
+              type="time"
+              value={form.horaFin}
+              min="07:30"
+              max="21:30"
+              onChange={(e) => setForm({ ...form, horaFin: e.target.value })}
+              required
+            />
+          </div>
+
+          {/* Timeline de disponibilidad */}
+          {form.salaId > 0 && form.fecha && (
+            <div style={{ marginBottom: '14px' }}>
+              <label className="label" style={{ marginBottom: '8px' }}>Disponibilidad del día</label>
+              <AvailabilityTimeline
+                ocupados={ocupados}
+                seleccion={{ horaInicio: form.horaInicio, horaFin: form.horaFin }}
+                loading={loadingAvail}
+              />
+            </div>
+          )}
+
+          <Input
+            label="Motivo"
+            placeholder="Describe brevemente el motivo de tu reserva"
+            value={form.motivo}
+            onChange={(e) => setForm({ ...form, motivo: e.target.value })}
+            wrapperClassName="mb-6"
+          />
+
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <Button type="button" variant="secondary" onClick={() => setShowModal(false)} fullWidth>Cancelar</Button>
+            <Button type="submit" variant="primary" disabled={saving} fullWidth>{saving ? 'Creando...' : 'Confirmar Reserva'}</Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* ─── Modal: Ajustar Reserva (HU-11, solo SECRETARIA) ─── */}
+      <Modal
+        open={adjusting !== null}
+        onClose={() => setAdjusting(null)}
+        title="Ajustar Reserva"
+        description={
+          adjusting ? (
+            <>
+              Reserva de <strong>{adjusting.usuario.nombre}</strong> — original: {formatDate(adjusting.fecha.split('T')[0])} · {formatTime(adjusting.horaInicio)}–{formatTime(adjusting.horaFin)}
+            </>
+          ) : null
+        }
+        size="lg"
+      >
+        {adjusting && (
+          <form onSubmit={handleAdjust}>
+            <div style={{ marginBottom: '14px' }}>
+              <label className="label">Sala *</label>
+              <select className="input-field" value={adjustForm.salaId}
+                onChange={(e) => setAdjustForm({ ...adjustForm, salaId: Number(e.target.value) })} required>
+                {salas.map((s) => (
+                  <option key={s.id} value={s.id}>{s.nombre}{s.ubicacion ? ` — ${s.ubicacion}` : ''}</option>
+                ))}
+              </select>
+            </div>
+
+            <Input
+              label="Fecha *"
+              type="date"
+              value={adjustForm.fecha}
+              min={new Date().toISOString().split('T')[0]}
+              onChange={(e) => setAdjustForm({ ...adjustForm, fecha: e.target.value })}
+              required
+              wrapperClassName="mb-3"
+            />
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '14px' }}>
+              <Input
+                label="Hora de Inicio *"
+                type="time"
+                value={adjustForm.horaInicio}
+                min="07:00"
+                max="21:00"
+                onChange={(e) => setAdjustForm({ ...adjustForm, horaInicio: e.target.value })}
+                required
+              />
+              <Input
+                label="Hora de Fin *"
+                type="time"
+                value={adjustForm.horaFin}
+                min="07:30"
+                max="21:30"
+                onChange={(e) => setAdjustForm({ ...adjustForm, horaFin: e.target.value })}
+                required
+              />
+            </div>
+
+            <Input
+              label="Motivo"
+              value={adjustForm.motivo}
+              onChange={(e) => setAdjustForm({ ...adjustForm, motivo: e.target.value })}
+              wrapperClassName="mb-6"
+            />
+
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <Button type="button" variant="secondary" onClick={() => setAdjusting(null)} fullWidth>Cancelar</Button>
+              <Button type="submit" variant="primary" disabled={savingAdjust} fullWidth>{savingAdjust ? 'Guardando...' : 'Guardar Ajuste'}</Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
+      <ConfirmDialog
+        open={cancelId !== null}
+        onClose={() => (cancelLoading ? null : setCancelId(null))}
+        onConfirm={confirmCancel}
+        title="Cancelar reserva"
+        description="Esta acción no se puede deshacer. La reserva quedará marcada como cancelada."
+        confirmText="Sí, cancelar"
+        cancelText="Volver"
+        variant="danger"
+        loading={cancelLoading}
+      />
+
+      {/* CP-012 E3: Modal de detalle de reserva */}
+      {detalleReserva && (
+        <Modal open={!!detalleReserva} onClose={() => setDetalleReserva(null)} title="Detalle de la reserva">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            <div>
+              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginBottom: '4px' }}>Sala</div>
+              <div style={{ fontSize: '0.95rem', fontWeight: 600 }}>{detalleReserva.sala.nombre}</div>
+              {detalleReserva.sala.ubicacion && (
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '2px' }}>{detalleReserva.sala.ubicacion}</div>
+              )}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginBottom: '4px' }}>Fecha</div>
+                <div style={{ fontSize: '0.85rem', textTransform: 'capitalize' }}>
+                  {formatDateLong(detalleReserva.fecha.split('T')[0])}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginBottom: '4px' }}>Horario</div>
+                <div style={{ fontSize: '0.85rem' }}>
+                  {formatTime(detalleReserva.horaInicio)} – {formatTime(detalleReserva.horaFin)}
+                </div>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginBottom: '4px' }}>Estado</div>
+              <span className={`badge ${detalleReserva.estado === 'CONFIRMADA' ? 'badge-success' : 'badge-danger'}`}>
+                {detalleReserva.estado}
+              </span>
+            </div>
+            <div>
+              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginBottom: '4px' }}>Reservada por</div>
+              <div style={{ fontSize: '0.85rem' }}>
+                {detalleReserva.usuario.nombre}
+                {detalleReserva.usuario.correoInstitucional && (
+                  <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginLeft: '6px' }}>
+                    ({detalleReserva.usuario.correoInstitucional})
+                  </span>
+                )}
+              </div>
+            </div>
+            {detalleReserva.motivo && (
+              <div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginBottom: '4px' }}>Motivo</div>
+                <div style={{ fontSize: '0.85rem' }}>{detalleReserva.motivo}</div>
+              </div>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '4px' }}>
+              <Button variant="secondary" onClick={() => setDetalleReserva(null)}>Cerrar</Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* CP-011 E5: Modal historial de cambios de la reserva */}
+      {auditReservaId && (
+        <AuditLogModal
+          open={!!auditReservaId}
+          onClose={() => setAuditReservaId(null)}
+          entidad="RESERVA"
+          entidadId={auditReservaId.id}
+          titulo={`Historial de la reserva en "${auditReservaId.sala}"`}
+        />
+      )}
+    </div>
+  );
+}
